@@ -226,6 +226,37 @@ namespace SeniorMA
         // legit / anti-cheat markers: lower the level unless a real client is identified
         static readonly string[] AntiMarkers = { "grimac", "nocheatplus", "anticheat", "anti-cheat", "cheatbreaker" };
 
+        // fake multi-loader stub: one jar that pretends to be Fabric + Forge + legacy Forge + LabyMod at once
+        static readonly string[][] LoaderFamilies = new string[][]
+        {
+            new string[]{"net/fabricmc/api/modinitializer","net/fabricmc/api/clientmodinitializer"},
+            new string[]{"net/minecraftforge/fml/common/mod"},
+            new string[]{"cpw/mods/fml/common/mod"},
+            new string[]{"net/labymod/api"},
+            new string[]{"net/neoforged/fml/common/mod"}
+        };
+
+        // behaviours of hidden loaders (only counted when the jar already looks packed)
+        static readonly string[] Behaviors = { "defineclass", "com/sun/jna/", "java/lang/instrument/instrumentation", "java/nio/channels/socketchannel" };
+        static readonly int[] BehaviorPts = { 2, 1, 2, 1 };
+        static readonly string[] BehaviorNames =
+        {
+            "custom class loader (defineClass) - loads hidden code",
+            "native code through JNA",
+            "java agent / instrumentation API",
+            "raw network socket"
+        };
+
+        // legit-looking mods that give an unfair advantage (banned on most servers)
+        static readonly string[] AdvNames = { "Freecam", "XRay", "Fullbright", "Baritone" };
+        static readonly string[][] AdvTokens = new string[][]
+        {
+            new string[]{"net/xolt/freecam","freecam"},
+            new string[]{"/xray/","xraymod","xray-mod","net/xray"},
+            new string[]{"fullbright","full-bright"},
+            new string[]{"cabaletta/baritone","baritone/api"}
+        };
+
         // known legit mod ids: skipped unless a cheat client is found inside their class paths
         static readonly HashSet<string> Allow = new HashSet<string>(new string[]
         {
@@ -270,6 +301,11 @@ namespace SeniorMA
             for (int g = 0; g < StructOthers.Length; g++)
                 for (int i = 0; i < StructOthers[g].Length; i++) Add(StructOthers[g][i], 2, g + 1);
             for (int i = 0; i < AntiMarkers.Length; i++) Add(AntiMarkers[i], 3, 0);
+            for (int g = 0; g < LoaderFamilies.Length; g++)
+                for (int i = 0; i < LoaderFamilies[g].Length; i++) Add(LoaderFamilies[g][i], 4, g);
+            for (int i = 0; i < Behaviors.Length; i++) Add(Behaviors[i], 5, i);
+            for (int g = 0; g < AdvTokens.Length; g++)
+                for (int i = 0; i < AdvTokens[g].Length; i++) Add(AdvTokens[g][i], 6, g);
             M = new Matcher(Pats);
         }
 
@@ -345,6 +381,21 @@ namespace SeniorMA
             return m.Success ? m.Groups[1].Value.Trim() : "";
         }
 
+        static double Entropy(byte[] b, int n)
+        {
+            if (n <= 0) return 0;
+            int[] c = new int[256];
+            for (int i = 0; i < n; i++) c[b[i]]++;
+            double e = 0;
+            for (int i = 0; i < 256; i++)
+            {
+                if (c[i] == 0) continue;
+                double pr = (double)c[i] / n;
+                e -= pr * Math.Log(pr, 2);
+            }
+            return e;
+        }
+
         static void ScanJar(string root, string file)
         {
             FileInfo fi = new FileInfo(file);
@@ -359,6 +410,12 @@ namespace SeniorMA
             int classes = 0;
             int shortNames = 0;
             long budget = 80L * 1024 * 1024;
+            bool agent = false;
+            bool hasMainClass = false;
+            int blobs = 0;
+            long blobBytes = 0;
+            long classBytes = 0;
+            bool padding = false;
             if (tbuf == null) tbuf = new byte[MaxRead];
             byte[] buf = tbuf;
 
@@ -374,6 +431,7 @@ namespace SeniorMA
                     if (low.EndsWith(".class"))
                     {
                         classes++;
+                        classBytes += e.Length;
                         string simple = low.Substring(low.LastIndexOf('/') + 1);
                         if (simple.Length - 6 <= 2) shortNames++;
                         if (budget <= 0) continue;
@@ -382,6 +440,27 @@ namespace SeniorMA
                         budget -= n;
                         M.Scan(buf, n, cf, false);
                         continue;
+                    }
+
+                    if (low == "meta-inf/manifest.mf")
+                    {
+                        int mn = ReadEntry(e, buf, 65536);
+                        string mt = Encoding.UTF8.GetString(buf, 0, mn).ToLowerInvariant();
+                        if (mt.IndexOf("premain-class") >= 0 || mt.IndexOf("agent-class") >= 0 ||
+                            mt.IndexOf("can-retransform-classes: true") >= 0 || mt.IndexOf("can-redefine-classes: true") >= 0)
+                            agent = true;
+                        if (Regex.IsMatch(mt, "(^|\n)main-class:")) hasMainClass = true;
+                    }
+                    else if (!IsMeta(low) && !low.EndsWith("/") && e.Length >= 8192)
+                    {
+                        string leaf = low.Substring(low.LastIndexOf('/') + 1);
+                        if (leaf.IndexOf('.') < 0)
+                        {
+                            int bn = ReadEntry(e, buf, 65536);
+                            double en = Entropy(buf, bn);
+                            if (en >= 7.5) { blobs++; blobBytes += e.Length; }
+                            else if (e.Length >= 524288 && en < 0.5) padding = true;
+                        }
                     }
 
                     if (IsMeta(low))
@@ -432,6 +511,9 @@ namespace SeniorMA
             bool combat = false;
             bool[] other = new bool[8];
             bool anti = false;
+            bool[] fam = new bool[8];
+            bool[] beh = new bool[8];
+            bool[] adv = new bool[8];
             for (int p = 0; p < P; p++)
             {
                 int k = Kind[p];
@@ -454,6 +536,18 @@ namespace SeniorMA
                 {
                     if (pf[p] || cf[p]) anti = true;
                 }
+                else if (k == 4)
+                {
+                    if (pf[p] || cf[p]) fam[o] = true;
+                }
+                else if (k == 5)
+                {
+                    if (cf[p]) beh[o] = true;
+                }
+                else if (k == 6)
+                {
+                    if (pf[p]) adv[o] = true;
+                }
             }
 
             int best = -1;
@@ -467,7 +561,49 @@ namespace SeniorMA
             if (best >= 0 && cp[best] > 0) clientPath = true;
 
             string idLow = modId.ToLowerInvariant();
-            if (idLow != "" && Allow.Contains(idLow) && !clientPath) return;
+
+            // ---- hidden loader / packed cheat detection (works even with zero readable strings) ----
+            int packed = 0;
+            List<string> pw = new List<string>();
+            if (agent)
+            {
+                packed += 6;
+                pw.Add("Java agent in the manifest (Premain-Class / Can-Retransform-Classes) - normal mods never have this");
+            }
+            int famCount = 0;
+            for (int i = 0; i < 8; i++) if (fam[i]) famCount++;
+            if (famCount >= 3)
+            {
+                packed += 4;
+                pw.Add("Fake multi-loader stub: Fabric + Forge + legacy Forge / LabyMod entry points inside ONE jar");
+            }
+            if (blobs >= 2 && blobBytes >= 100 * 1024)
+            {
+                packed += 4;
+                pw.Add(blobs + " encrypted data files with no extension (" + (blobBytes / 1024) + " KB) - hidden payload");
+            }
+            if (padding)
+            {
+                packed += 2;
+                pw.Add("Huge empty padding file (used to hide / inflate the jar)");
+            }
+            if (classes <= 25 && blobBytes > 0 && blobBytes > classBytes * 5)
+            {
+                packed += 2;
+                pw.Add("Only tiny loader classes, but a very large encrypted payload");
+            }
+            if (packed > 0)
+            {
+                if (hasMainClass) { packed += 1; pw.Add("Mod jar has a Main-Class (it can run by itself)"); }
+                if (idLow != "" && idLow.Length <= 2) { packed += 1; pw.Add("Meaningless mod id '" + modId + "' and empty metadata"); }
+                for (int b = 0; b < Behaviors.Length; b++)
+                {
+                    if (beh[b]) { packed += BehaviorPts[b]; pw.Add("Uses " + BehaviorNames[b]); }
+                }
+            }
+            bool packedHit = packed >= 6;
+
+            if (idLow != "" && Allow.Contains(idLow) && !clientPath && !packedHit) return;
 
             Hit h = new Hit();
             h.Rel = rel;
@@ -485,6 +621,13 @@ namespace SeniorMA
                 else h.Why.Add("Client name found inside the code (not in file paths)");
             }
 
+            if (packed > 0)
+            {
+                score += packed;
+                for (int i = 0; i < pw.Count; i++) h.Why.Add(pw[i]);
+                if (packedHit && h.Client == "") h.Client = "Packed / hidden loader (unknown cheat client)";
+            }
+
             int strongPath = 0;
             int strongCont = 0;
             List<string> contTerms = new List<string>();
@@ -496,6 +639,16 @@ namespace SeniorMA
             for (int t = 0; t < contTerms.Count && h.Terms.Count < 10; t++) h.Terms.Add(contTerms[t]);
             if (strongPath > 0) h.Why.Add(strongPath + " class/file name(s) match known cheat modules");
             if (strongCont > 0) h.Why.Add(strongCont + " cheat-module string(s) found inside the code");
+
+            List<string> advHits = new List<string>();
+            for (int g = 0; g < AdvNames.Length; g++) if (adv[g]) advHits.Add(AdvNames[g]);
+            if (advHits.Count > 0)
+            {
+                score += 6;
+                h.Why.Add("Advantage mod: " + string.Join(", ", advHits.ToArray()) + " - banned / not allowed on most servers");
+                if (h.Client == "") h.Client = advHits[0] + " (advantage mod)";
+                for (int i = 0; i < advHits.Count && h.Terms.Count < 10; i++) h.Terms.Add(advHits[i]);
+            }
 
             int others = 0;
             for (int i = 1; i < 8; i++) if (other[i]) others++;
